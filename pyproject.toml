@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-robot"
+version = "0.1.0"
+description = "A simple Ackermann-steered robot with GNSS + LiDAR localization, simulated in CARLA"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["numpy>=1.21", "scipy>=1.7"]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.4"]
+carla = ["carla>=0.9.14"]
+dev = ["pytest>=7", "matplotlib>=3.4"]
+
+[tool.setuptools]
+packages = ["simple_robot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
