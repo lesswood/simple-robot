@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .gnss import CarlaGeoProjection
-from .lidar import cloud_to_scan
+from .lidar import cloud_to_scan, voxel_downsample
 from .vehicle import AckermannParams
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,14 @@ def carla_lidar_to_body(raw: np.ndarray, mount_body_xyz) -> np.ndarray:
     pts = np.array(raw[:, :3], dtype=float)
     pts[:, 1] *= -1.0
     return pts + np.asarray(mount_body_xyz, dtype=float)
+
+
+def remove_own_body(points_xyz: np.ndarray, params: AckermannParams, pad: float = 0.3) -> np.ndarray:
+    """Drop LiDAR returns from the robot's own body (body frame, rear-axle origin)."""
+    x, y = points_xyz[:, 0], points_xyz[:, 1]
+    inside = ((x > -params.rear_overhang - pad) & (x < params.length - params.rear_overhang + pad)
+              & (np.abs(y) < params.width / 2.0 + pad))
+    return points_xyz[~inside]
 
 
 def metres_to_lat_lon_deg(sigma_m: float, lat0: float) -> tuple[float, float]:
@@ -86,6 +94,11 @@ class CarlaConfig:
     lidar_rate: float = 10.0             # [Hz] processing rate (decimated in software)
     scan_z_min: float = 0.5              # height band (above ground) flattened into the 2D scan
     scan_z_max: float = 2.5
+    obstacle_z_min: float = 0.3          # height band used for obstacle avoidance (lower: catches kerb-high
+    obstacle_z_max: float = 2.0          # objects, children, bollards; upper: anything the body could hit)
+    # Vehicle dynamics assumed by the planner (braking is friction limited, so independent of mass)
+    max_decel: float = 5.0               # [m/s^2]
+    accel_tau: float = 0.3               # [s] drivetrain/brake response lag
     # Wheel odometry noise (emulates encoders + steering angle sensor)
     speed_noise: float = 0.05
     steer_noise_deg: float = 0.3
@@ -146,7 +159,14 @@ class CarlaRobot:
         wheelbase = float(np.linalg.norm(front - rear))
         track = float(np.linalg.norm(w[0] - w[1]))
         max_steer = np.deg2rad(phys.wheels[0].max_steer_angle)
-        self.params = AckermannParams(wheelbase=wheelbase, track=track, max_steer=max_steer)
+        # Footprint from the bounding box (actor frame, centre + half extents)
+        bb = self.vehicle.bounding_box
+        rear_bumper = bb.location.x - bb.extent.x
+        self.params = AckermannParams(
+            wheelbase=wheelbase, track=track, max_steer=max_steer,
+            length=2.0 * bb.extent.x, width=2.0 * bb.extent.y,
+            rear_overhang=self.rear_axle_offset - rear_bumper,
+            max_decel=cfg.max_decel, accel_tau=cfg.accel_tau)
 
     def _spawn_sensors(self) -> None:
         carla, cfg = self.carla, self.cfg
@@ -172,7 +192,12 @@ class CarlaRobot:
                 lbp.set_attribute(k, str(v))
         lx, ly, lz = cfg.lidar_mount
         self.lidar = self.world.spawn_actor(lbp, carla.Transform(carla.Location(lx, ly, lz)), attach_to=self.vehicle)
-        self.actors += [self.gnss, self.lidar]
+        cbp = lib.find("sensor.other.collision")
+        self.collision = self.world.spawn_actor(cbp, carla.Transform(), attach_to=self.vehicle)
+        self.collisions: list = []      # (frame, other actor type) - evaluation only
+        self.collision.listen(lambda e: self.collisions.append((e.frame, getattr(e.other_actor, "type_id", "?"))))
+        self.actors += [self.gnss, self.lidar, self.collision]
+        self.walkers: list = []         # (walker actor, crossing point (CARLA xy), direction (CARLA xy), half-width)
 
         self._q_gnss: queue.Queue = queue.Queue()
         self._q_lidar: queue.Queue = queue.Queue()
@@ -200,13 +225,16 @@ class CarlaRobot:
         gnss = self._get(self._q_gnss, self.frame)
         lidar = self._get(self._q_lidar, self.frame)
 
-        meas = {"v": self._wheel_speed(), "steer": self._steer_angle(), "gnss": None, "scan": None}
+        self._update_walkers()
+        meas = {"v": self._wheel_speed(), "steer": self._steer_angle(), "gnss": None, "scan": None, "obstacles": None}
         if gnss is not None and self.tick_count % max(1, round(1.0 / (cfg.gnss_rate * cfg.dt))) == 0:
             meas["gnss"] = self.geo.to_enu(gnss.latitude, gnss.longitude, gnss.altitude)
         if lidar is not None and self.tick_count % max(1, round(1.0 / (cfg.lidar_rate * cfg.dt))) == 0:
             raw = np.frombuffer(lidar.raw_data, dtype=np.float32).reshape(-1, 4)
-            pts = carla_lidar_to_body(raw, self.lidar_mount_body)
-            meas["scan"] = cloud_to_scan(pts, cfg.scan_z_min, cfg.scan_z_max, r_min=2.5, r_max=cfg.lidar_range)
+            pts = remove_own_body(carla_lidar_to_body(raw, self.lidar_mount_body), self.params)
+            meas["scan"] = cloud_to_scan(pts, cfg.scan_z_min, cfg.scan_z_max, r_min=0.0, r_max=cfg.lidar_range)
+            obs = cloud_to_scan(pts, cfg.obstacle_z_min, cfg.obstacle_z_max, r_min=0.0, r_max=40.0)
+            meas["obstacles"] = voxel_downsample(obs, 0.15)
         return meas
 
     def _wheel_speed(self) -> float:
@@ -221,19 +249,101 @@ class CarlaRobot:
         return float(steer + self.rng.normal(0.0, np.deg2rad(self.cfg.steer_noise_deg)))
 
     # -------------------------------------------------------------- control
-    def apply(self, speed: float, accel: float, steer: float, stop: bool = False) -> None:
+    def apply(self, speed: float, accel: float, steer: float, stop: bool = False, reverse: bool = False) -> None:
+        """Apply a command from the stack: signed target speed [m/s] (negative = reverse), signed
+        acceleration request [m/s^2] and steering angle [rad, + = left]."""
         carla = self.carla
         steer = float(np.clip(steer, -self.params.max_steer, self.params.max_steer))
         if self.cfg.control == "ackermann":
+            # VehicleAckermannControl: steer [rad, + = right], speed [m/s, < 0 reverses],
+            # acceleration = magnitude used to reach that speed (we pass the braking demand through).
+            mag = float(np.clip(abs(accel), 0.5, self.params.max_decel))
             ctrl = carla.VehicleAckermannControl(
                 steer=-steer, steer_speed=np.deg2rad(120.0),
-                speed=0.0 if stop else float(speed), acceleration=3.0 if stop else 1.5, jerk=0.0)
+                speed=0.0 if stop else float(speed), acceleration=self.params.max_decel if stop else mag, jerk=0.0)
             self.vehicle.apply_ackermann_control(ctrl)
         else:
-            throttle = float(np.clip(accel / 3.0, 0.0, 0.75))
-            brake = 1.0 if stop else float(np.clip(-accel / 6.0, 0.0, 1.0))
+            drive = -accel if reverse else accel          # positive = push in the direction of travel
+            throttle = 0.0 if stop else float(np.clip(drive / 3.0, 0.0, 0.75))
+            brake = 1.0 if stop else float(np.clip(-drive / self.params.max_decel, 0.0, 1.0))
             self.vehicle.apply_control(carla.VehicleControl(
-                throttle=0.0 if stop else throttle, brake=brake, steer=float(-steer / self.params.max_steer)))
+                throttle=throttle, brake=brake, steer=float(-steer / self.params.max_steer), reverse=bool(reverse)))
+
+    # ------------------------------------------------------------- scenario
+    def drivable(self, xy: np.ndarray) -> np.ndarray:
+        """True for ENU points on a driving lane (used to keep swerves on the road)."""
+        carla = self.carla
+        out = np.zeros(len(xy), dtype=bool)
+        for i, (e, n) in enumerate(xy):
+            x, y = enu_to_carla_xy(e, n)
+            wp = self.map.get_waypoint(carla.Location(x, y, 0.5), project_to_road=False,
+                                       lane_type=carla.LaneType.Driving)
+            out[i] = wp is not None
+        return out
+
+    def _route_frame(self, route_xy: np.ndarray, s: float):
+        """Point (ENU) and heading of the route at arc length ``s``."""
+        d = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(route_xy, axis=0), axis=1))])
+        i = int(np.clip(np.searchsorted(d, s), 1, len(route_xy) - 1))
+        seg = route_xy[i] - route_xy[i - 1]
+        return route_xy[i], float(np.arctan2(seg[1], seg[0]))
+
+    def spawn_parked_cars(self, route_xy: np.ndarray, n: int, start: float = 35.0, spacing: float = 45.0,
+                          lateral: float = 1.0) -> int:
+        """Park ``n`` static cars along the route, alternating sides, partly blocking the lane."""
+        carla = self.carla
+        lib = self.world.get_blueprint_library()
+        bps = [b for b in lib.filter("vehicle.*") if not b.has_attribute("number_of_wheels")
+               or int(b.get_attribute("number_of_wheels").as_int()) == 4] or lib.filter("vehicle.*")
+        spawned = 0
+        for i in range(n):
+            (e, nn), yaw = self._route_frame(route_xy, start + i * spacing)
+            side = 1.0 if i % 2 == 0 else -1.0                         # + = left of the route
+            e, nn = e - side * lateral * np.sin(yaw), nn + side * lateral * np.cos(yaw)
+            x, y = enu_to_carla_xy(e, nn)
+            bp = bps[int(self.rng.integers(len(bps)))]
+            tf = carla.Transform(carla.Location(x, y, 0.3), carla.Rotation(yaw=-np.rad2deg(yaw)))
+            actor = self.world.try_spawn_actor(bp, tf)
+            if actor is not None:
+                actor.set_simulate_physics(False)
+                self.actors.append(actor)
+                spawned += 1
+        return spawned
+
+    def spawn_walkers(self, route_xy: np.ndarray, n: int, start: float = 60.0, spacing: float = 50.0,
+                      half_width: float = 6.0, speed: float = 1.2) -> int:
+        """Pedestrians pacing back and forth across the route (driven directly, no AI navigation)."""
+        carla = self.carla
+        bps = self.world.get_blueprint_library().filter("walker.pedestrian.*")
+        spawned = 0
+        for i in range(n):
+            (e, nn), yaw = self._route_frame(route_xy, start + i * spacing)
+            normal = np.array([-np.sin(yaw), np.cos(yaw)])
+            p0 = np.array([e, nn]) + normal * half_width * (1 if i % 2 == 0 else -1)
+            x, y = enu_to_carla_xy(*p0)
+            bp = bps[int(self.rng.integers(len(bps)))]
+            if bp.has_attribute("is_invincible"):
+                bp.set_attribute("is_invincible", "false")
+            walker = self.world.try_spawn_actor(bp, carla.Transform(carla.Location(x, y, 1.0)))
+            if walker is None:
+                continue
+            self.actors.append(walker)
+            centre = np.array(enu_to_carla_xy(e, nn))
+            direction = centre - np.array([x, y])
+            self.walkers.append([walker, centre, direction / np.linalg.norm(direction), half_width, speed])
+            spawned += 1
+        return spawned
+
+    def _update_walkers(self) -> None:
+        carla = self.carla
+        for w in self.walkers:
+            walker, centre, direction, half, speed = w
+            loc = walker.get_transform().location
+            along = float(np.dot(np.array([loc.x, loc.y]) - centre, direction))
+            if along > half:            # reached the far side: turn around
+                w[2] = direction = -direction
+            walker.apply_control(carla.WalkerControl(
+                direction=carla.Vector3D(float(direction[0]), float(direction[1]), 0.0), speed=speed))
 
     # ------------------------------------------------------------- helpers
     def ground_truth(self) -> np.ndarray:
@@ -272,6 +382,16 @@ class CarlaRobot:
         self.world.debug.draw_point(carla.Location(x, y, 0.5), size=0.08,
                                     color=carla.Color(255, 40, 40), life_time=life_time)
 
+    def draw_local_plan(self, xy_odom: np.ndarray, map_in_odom, life_time: float = 0.6) -> None:
+        """Draw the local plan (given in the stack's odom frame)."""
+        from .geometry import ominus, transform_points
+        carla = self.carla
+        xy = transform_points(np.asarray(xy_odom)[:40:3], ominus(map_in_odom, np.zeros(3)))
+        for e, n in xy:
+            x, y = enu_to_carla_xy(e, n)
+            self.world.debug.draw_point(carla.Location(x, y, 0.4), size=0.05,
+                                        color=carla.Color(40, 220, 40), life_time=life_time)
+
     def follow_with_spectator(self) -> None:
         carla = self.carla
         tf = self.vehicle.get_transform()
@@ -281,7 +401,7 @@ class CarlaRobot:
             carla.Transform(loc, carla.Rotation(pitch=-25.0, yaw=tf.rotation.yaw)))
 
     def destroy(self) -> None:
-        for s in (getattr(self, "gnss", None), getattr(self, "lidar", None)):
+        for s in (getattr(self, "gnss", None), getattr(self, "lidar", None), getattr(self, "collision", None)):
             if s is not None and s.is_alive:
                 s.stop()
         self.client.apply_batch([self.carla.command.DestroyActor(a) for a in self.actors if a.is_alive])

@@ -62,6 +62,19 @@ class Path:
             v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2 * a_long_max * self.seg_len[i]))
         return v
 
+    def sample(self, s_query: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Points and headings at arc lengths ``s_query`` (wrapped for closed paths, clamped otherwise)."""
+        s_query = np.asarray(s_query, dtype=float)
+        s_query = s_query % self.length if self.closed else np.clip(s_query, 0.0, self.length)
+        xy = np.column_stack([np.interp(s_query, self.s, self.xy[:, 0]), np.interp(s_query, self.s, self.xy[:, 1])])
+        j = np.clip(np.searchsorted(self.s, s_query, side="right") - 1, 0, len(self.seg_len) - 1)
+        return xy, self.yaw[j]
+
+    def lateral_offset(self, i: int, p) -> float:
+        """Signed lateral distance of ``p`` from the path at vertex ``i`` (positive = left)."""
+        d = np.asarray(p)[:2] - self.xy[i]
+        return float(-np.sin(self.yaw[i]) * d[0] + np.cos(self.yaw[i]) * d[1])
+
     def remaining(self, i: int) -> float:
         return float(self.length - self.s[i])
 

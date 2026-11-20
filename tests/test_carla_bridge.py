@@ -71,3 +71,38 @@ def test_run_carla_script_end_to_end(tmp_path):
     assert "goal reached" in out.stdout, out.stdout
     rmse = float(out.stdout.split("position RMSE ")[1].split(" m")[0])
     assert rmse < 0.1  # fake GNSS is noise-free, out.stdout
+
+
+def test_remove_own_body():
+    from simple_robot.carla_bridge import remove_own_body
+    from simple_robot.vehicle import AckermannParams
+    p = AckermannParams(length=4.6, width=1.9, rear_overhang=0.9)
+    pts = np.array([[0.0, 0.0, 1.0], [3.5, 0.5, 1.0], [-1.0, 0.0, 1.0], [5.0, 0.0, 1.0], [1.0, 2.0, 1.0]])
+    assert np.allclose(remove_own_body(pts, p), pts[[3, 4]])
+
+
+def test_bridge_footprint_from_bounding_box(robot):
+    assert robot.params.length == pytest.approx(4.6)
+    assert robot.params.width == pytest.approx(1.9)
+    assert robot.params.rear_overhang == pytest.approx(0.9)   # rear axle 1.4 m behind centre, bumper 2.3 m
+    assert robot.drivable(np.array([[10.0, 0.0], [10.0, 8.5]])).tolist() == [True, False]
+
+
+def _run_fake(tmp_path, *extra):
+    env = dict(os.environ)
+    shim = tmp_path / "carla.py"
+    shim.write_text("from fake_carla import *\nfrom fake_carla import command\n")
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), os.path.join(ROOT, "tests"), ROOT])
+    return subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "run_carla.py"), "--route-length", "200",
+                           "--timeout", "90", "--log", str(tmp_path / "log.csv"), *extra],
+                          env=env, capture_output=True, text=True, timeout=600)
+
+
+def test_run_carla_avoids_parked_cars_and_walkers(tmp_path):
+    out = _run_fake(tmp_path, "--parked-cars", "3", "--walkers", "1")
+    assert out.returncode == 0, out.stderr
+    assert "parked cars: 3" in out.stdout and "walkers: 1" in out.stdout
+    assert "goal reached" in out.stdout, out.stdout
+    assert "collisions: 0 " in out.stdout, out.stdout
+    blind = _run_fake(tmp_path, "--parked-cars", "3", "--no-avoidance")
+    assert "collisions: 0 " not in blind.stdout, blind.stdout
